@@ -207,7 +207,632 @@ class SurnameDataset(Dataset):
 
         return {'x_surname': surname_vector,
                 'y_nationality': nationality_index}
+    #在返回结果时把姓氏和国籍连接在一起
+3.1.2 Vocabulary, Vectorizer, and DataLoader
+
+为了使用字符对姓氏进行分类，我们使用词汇表、向量化器和DataLoader将姓氏字符串转换为向量化的minibatches。这些数据结构与“Example: Classifying Sentiment of Restaurant Reviews”中使用的数据结构相同，它们举例说明了一种多态性，这种多态性将姓氏的字符标记与Yelp评论的单词标记相同对待。数据不是通过将字令牌映射到整数来向量化的，而是通过将字符映射到整数来向量化的。
+
+THE VOCABULARY CLASS
+
+本例中使用的词汇类与“example: Classifying Sentiment of Restaurant Reviews”中的词汇完全相同，该词汇类将Yelp评论中的单词映射到对应的整数。简要概述一下，词汇表是两个Python字典的协调，这两个字典在令牌(在本例中是字符)和整数之间形成一个双射;也就是说，第一个字典将字符映射到整数索引，第二个字典将整数索引映射到字符。add_token方法用于向词汇表中添加新的令牌，lookup_token方法用于检索索引，lookup_index方法用于检索给定索引的令牌(在推断阶段很有用)。与Yelp评论的词汇表不同，我们使用的是one-hot词汇表，不计算字符出现的频率，只对频繁出现的条目进行限制。这主要是因为数据集很小，而且大多数字符足够频繁。
+
+THE SURNAMEVECTORIZER
+
+虽然词汇表将单个令牌(字符)转换为整数，但SurnameVectorizer负责应用词汇表并将姓氏转换为向量。实例化和使用非常类似于“示例:对餐馆评论的情绪进行分类”中的ReviewVectorizer，但有一个关键区别:字符串没有在空格上分割。姓氏是字符的序列，每个字符在我们的词汇表中是一个单独的标记。然而，在“卷积神经网络”出现之前，我们将忽略序列信息，通过迭代字符串输入中的每个字符来创建输入的收缩one-hot向量表示。我们为以前未遇到的字符指定一个特殊的令牌，即UNK。由于我们仅从训练数据实例化词汇表，而且验证或测试数据中可能有惟一的字符，所以在字符词汇表中仍然使用UNK符号。
+
+虽然我们在这个示例中使用了收缩的one-hot，但是在后面的实验中，将了解其他向量化方法，它们是one-hot编码的替代方法，有时甚至更好。具体来说，在“示例:使用CNN对姓氏进行分类”中，将看到一个热门矩阵，其中每个字符都是矩阵中的一个位置，并具有自己的热门向量。然后，在实验5中，将学习嵌入层，返回整数向量的向量化，以及如何使用它们创建密集向量矩阵。看一下示例4-6中SurnameVectorizer的代码。
+
+Example 4-6. Implementing SurnameVectorizer
+
+class SurnameVectorizer(object):
+    """ The Vectorizer which coordinates the Vocabularies and puts them to use"""
+    def __init__(self, surname_vocab, nationality_vocab):
+        self.surname_vocab = surname_vocab
+        self.nationality_vocab = nationality_vocab
+
+    def vectorize(self, surname):
+        """Vectorize the provided surname
+
+        Args:
+            surname (str): the surname
+        Returns:
+            one_hot (np.ndarray): a collapsed one-hot encoding
+        """
+        vocab = self.surname_vocab
+        one_hot = np.zeros(len(vocab), dtype=np.float32)
+        for token in surname:
+            one_hot[vocab.lookup_token(token)] = 1
+        return one_hot
+    #使用one-hot方法将姓氏向量化
+
+    @classmethod
+    def from_dataframe(cls, surname_df):
+        """Instantiate the vectorizer from the dataset dataframe
+
+        Args:
+            surname_df (pandas.DataFrame): the surnames dataset
+        Returns:
+            an instance of the SurnameVectorizer
+        """
+        surname_vocab = Vocabulary(unk_token="@")
+        nationality_vocab = Vocabulary(add_unk=False)
+        #如果遇见特殊令牌则不对他进行分类
+        
+
+        for index, row in surname_df.iterrows():
+            for letter in row.surname:
+                surname_vocab.add_token(letter)
+            nationality_vocab.add_token(row.nationality)
+
+        return cls(surname_vocab, nationality_vocab)
+
+3.1.3 The Surname Classifier Model
+
+SurnameClassifier是本实验前面介绍的MLP的实现(示例4-7)。第一个线性层将输入向量映射到中间向量，并对该向量应用非线性。第二线性层将中间向量映射到预测向量。
+
+在最后一步中，可选地应用softmax操作，以确保输出和为1;这就是所谓的“概率”。它是可选的原因与我们使用的损失函数的数学公式有关——交叉熵损失。我们研究了“损失函数”中的交叉熵损失。回想一下，交叉熵损失对于多类分类是最理想的，但是在训练过程中软最大值的计算不仅浪费而且在很多情况下并不稳定。
+
+Example 4-7. The SurnameClassifier as an MLP
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SurnameClassifier(nn.Module):
+    """ A 2-layer Multilayer Perceptron for classifying surnames """
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        """
+        Args:
+            input_dim (int): the size of the input vectors
+            hidden_dim (int): the output size of the first Linear layer
+            output_dim (int): the output size of the second Linear layer
+        """
+        super(SurnameClassifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x_in, apply_softmax=False):
+        """The forward pass of the classifier
+
+        Args:
+            x_in (torch.Tensor): an input data tensor.
+                x_in.shape should be (batch, input_dim)
+            apply_softmax (bool): a flag for the softmax activation
+                should be false if used with the Cross Entropy losses
+        Returns:
+            the resulting tensor. tensor.shape should be (batch, output_dim)
+        """
+        intermediate_vector = F.relu(self.fc1(x_in))
+        prediction_vector = self.fc2(intermediate_vector)
+
+        if apply_softmax:
+            prediction_vector = F.softmax(prediction_vector, dim=1)
+
+        return prediction_vector
+
+3.1.4 The Training Routine
+
+虽然我们使用了不同的模型、数据集和损失函数，但是训练例程是相同的。因此，在例4-8中，我们只展示了args以及本例中的训练例程与“示例:餐厅评论情绪分类”中的示例之间的主要区别。
+
+Example 4-8. The args for classifying surnames with an MLP
+
+args = Namespace(
+    # Data and path information
+    surname_csv="data/surnames/surnames_with_splits.csv",
+    vectorizer_file="vectorizer.json",
+    model_state_file="model.pth",
+    save_dir="model_storage/ch4/surname_mlp",
+    # Model hyper parameters
+    hidden_dim=300,
+    # Training  hyper parameters
+    seed=1337,
+    num_epochs=100,
+    early_stopping_criteria=5,
+    learning_rate=0.001,
+    batch_size=64,
+    # Runtime options omitted for space
+)
+训练中最显著的差异与模型中输出的种类和使用的损失函数有关。在这个例子中，输出是一个多类预测向量，可以转换为概率。正如在模型描述中所描述的，这种输出的损失类型仅限于CrossEntropyLoss和NLLLoss。由于它的简化，我们使用了CrossEntropyLoss。
+
+在例4-9中，我们展示了数据集、模型、损失函数和优化器的实例化。这些实例应该看起来与“示例:将餐馆评论的情绪分类”中的实例几乎相同。事实上，在本课程后面的实验中，这种模式将对每个示例进行重复。
+
+Example 4-9. Instantiating the dataset, model, loss, and optimizer
+
+dataset = SurnameDataset.load_dataset_and_make_vectorizer(args.surname_csv)
+vectorizer = dataset.get_vectorizer()
+
+classifier = SurnameClassifier(input_dim=len(vectorizer.surname_vocab),
+                               hidden_dim=args.hidden_dim,
+                               output_dim=len(vectorizer.nationality_vocab))
+
+classifier = classifier.to(args.device)    
+
+loss_func = nn.CrossEntropyLoss(dataset.class_weights)
+#交叉熵损失
+optimizer = optim.Adam(classifier.parameters(), lr=args.learning_rate)
+THE TRAINING LOOP
+
+与“Example: Classifying Sentiment of Restaurant Reviews”中的训练循环相比，本例的训练循环除了变量名以外几乎是相同的。具体来说，示例4-10显示了使用不同的key从batch_dict中获取数据。除了外观上的差异，训练循环的功能保持不变。利用训练数据，计算模型输出、损失和梯度。然后，使用梯度来更新模型。
+
+Example 4-10. A snippet of the training loop
+
+# the training routine is these 5 steps:
+
+# --------------------------------------
+# step 1. zero the gradients
+optimizer.zero_grad()
+
+# step 2. compute the output
+y_pred = classifier(batch_dict['x_surname'])
+
+# step 3. compute the loss
+loss = loss_func(y_pred, batch_dict['y_nationality'])
+loss_batch = loss.to("cpu").item()
+running_loss += (loss_batch - running_loss) / (batch_index + 1)
+
+# step 4. use loss to produce gradients
+loss.backward()
+
+# step 5. use optimizer to take gradient step
+optimizer.step()
+
+3.1.5 Model Evaluation and Prediction
+
+要理解模型的性能，应该使用定量和定性方法分析模型。定量测量出的测试数据的误差，决定了分类器能否推广到不可见的例子。定性地说，可以通过查看分类器的top-k预测来为一个新示例开发模型所了解的内容的直觉。
+
+3.1.5.1 EVALUATING ON THE TEST DATASET
+
+评价SurnameClassifier测试数据,我们执行相同的常规的routine文本分类的例子“餐馆评论的例子:分类情绪”:我们将数据集设置为遍历测试数据,调用classifier.eval()方法,并遍历测试数据以同样的方式与其他数据。在这个例子中，调用classifier.eval()可以防止PyTorch在使用测试/评估数据时更新模型参数。
+
+该模型对测试数据的准确性达到50%左右。如果在附带的notebook中运行训练例程，会注意到在训练数据上的性能更高。这是因为模型总是更适合它所训练的数据，所以训练数据的性能并不代表新数据的性能。如果遵循代码，你可以尝试隐藏维度的不同大小，应该注意到性能的提高。然而，这种增长不会很大(尤其是与“用CNN对姓氏进行分类的例子”中的模型相比)。其主要原因是收缩的onehot向量化方法是一种弱表示。虽然它确实简洁地将每个姓氏表示为单个向量，但它丢弃了字符之间的顺序信息，这对于识别起源非常重要。
+
+3.1.5.2 CLASSIFYING A NEW SURNAME
+
+示例4-11显示了分类新姓氏的代码。给定一个姓氏作为字符串，该函数将首先应用向量化过程，然后获得模型预测。注意，我们包含了apply_softmax标志，所以结果包含概率。模型预测，在多项式的情况下，是类概率的列表。我们使用PyTorch张量最大函数来得到由最高预测概率表示的最优类。
+
+Example 4-11. A function for performing nationality prediction
+
+def predict_nationality(name, classifier, vectorizer):
+    vectorized_name = vectorizer.vectorize(name)
+    vectorized_name = torch.tensor(vectorized_name).view(1, -1)
+    result = classifier(vectorized_name, apply_softmax=True)
+
+    probability_values, indices = result.max(dim=1)
+    index = indices.item()
+
+    predicted_nationality = vectorizer.nationality_vocab.lookup_index(index)
+    probability_value = probability_values.item()
+
+    return {'nationality': predicted_nationality,
+            'probability': probability_value}
+3.1.5.3 RETRIEVING THE TOP-K PREDICTIONS FOR A NEW SURNAME
+
+不仅要看最好的预测，还要看更多的预测。例如，NLP中的标准实践是采用k-best预测并使用另一个模型对它们重新排序。PyTorch提供了一个torch.topk函数，它提供了一种方便的方法来获得这些预测，如示例4-12所示。
+
+Example 4-12. Predicting the top-k nationalities
+
+def predict_topk_nationality(name, classifier, vectorizer, k=5):
+    vectorized_name = vectorizer.vectorize(name)
+    vectorized_name = torch.tensor(vectorized_name).view(1, -1)
+    prediction_vector = classifier(vectorized_name, apply_softmax=True)
+    probability_values, indices = torch.topk(prediction_vector, k=k)
+
+    # returned size is 1,k
+    probability_values = probability_values.detach().numpy()[0]
+    indices = indices.detach().numpy()[0]
+
+    results = []
+    for prob_value, index in zip(probability_values, indices):
+        nationality = vectorizer.nationality_vocab.lookup_index(index)
+        results.append({'nationality': nationality,
+                        'probability': prob_value})
+
+    return results
+3.1.6 Regularizing MLPs: Weight Regularization and Structural Regularization (or Dropout)
+
+在实验3中，我们解释了正则化是如何解决过拟合问题的，并研究了两种重要的权重正则化类型——L1和L2。这些权值正则化方法也适用于MLPs和卷积神经网络，我们将在本实验后面介绍。除权值正则化外，对于深度模型(即例如本实验讨论的前馈网络，一种称为dropout的结构正则化方法变得非常重要。
+
+DROPOUT
+
+简单地说，在训练过程中，dropout有一定概率使属于两个相邻层的单元之间的连接减弱。这有什么用呢?我们从斯蒂芬•梅里蒂(Stephen Merity)的一段直观(且幽默)的解释开始：“Dropout，简单地说，是指如果你能在喝醉的时候反复学习如何做一件事，那么你应该能够在清醒的时候做得更好。这一见解产生了许多最先进的结果和一个新兴的领域。”
+
+神经网络——尤其是具有大量分层的深层网络——可以在单元之间创建有趣的相互适应。“Coadaptation”是神经科学中的一个术语，但在这里它只是指一种情况，即两个单元之间的联系变得过于紧密，而牺牲了其他单元之间的联系。这通常会导致模型与数据过拟合。通过概率地丢弃单元之间的连接，我们可以确保没有一个单元总是依赖于另一个单元，从而产生健壮的模型。dropout不会向模型中添加额外的参数，但是需要一个超参数——“drop probability”。drop probability，它是单位之间的连接drop的概率。通常将下降概率设置为0.5。例4-13给出了一个带dropout的MLP的重新实现。
+
+Example 4-13. MLP with dropout
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultilayerPerceptron(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        """
+        Args:
+            input_dim (int): the size of the input vectors
+            hidden_dim (int): the output size of the first Linear layer
+            output_dim (int): the output size of the second Linear layer
+        """
+        super(MultilayerPerceptron, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x_in, apply_softmax=False):
+        """The forward pass of the MLP
+
+        Args:
+            x_in (torch.Tensor): an input data tensor.
+                x_in.shape should be (batch, input_dim)
+            apply_softmax (bool): a flag for the softmax activation
+                should be false if used with the Cross Entropy losses
+        Returns:
+            the resulting tensor. tensor.shape should be (batch, output_dim)
+        """
+        intermediate = F.relu(self.fc1(x_in))
+        output = self.fc2(F.dropout(intermediate, p=0.5))
+        #dropout
+
+        if apply_softmax:
+            output = F.softmax(output, dim=1)
+        return output
+请注意，dropout只适用于训练期间，不适用于评估期间。作为练习，可以尝试带有dropout的SurnameClassifier模型，看看它如何更改结果。
+
+3.2 Convolutional Neural Networks
+
+在本实验的第一部分中，我们深入研究了MLPs、由一系列线性层和非线性函数构建的神经网络。mlp不是利用顺序模式的最佳工具。例如，在姓氏数据集中，姓氏可以有(不同长度的)段，这些段可以显示出相当多关于其起源国家的信息(如“O’Neill”中的“O”、“Antonopoulos”中的“opoulos”、“Nagasawa”中的“sawa”或“Zhu”中的“Zh”)。这些段的长度可以是可变的，挑战是在不显式编码的情况下捕获它们。
+
+在本节中，我们将介绍卷积神经网络(CNN)，这是一种非常适合检测空间子结构(并因此创建有意义的空间子结构)的神经网络。CNNs通过使用少量的权重来扫描输入数据张量来实现这一点。通过这种扫描，它们产生表示子结构检测(或不检测)的输出张量。
+
+在本节的其余部分中，我们首先描述CNN的工作方式，以及在设计CNN时应该考虑的问题。我们深入研究CNN超参数，目的是提供直观的行为和这些超参数对输出的影响。最后，我们通过几个简单的例子逐步说明CNNs的机制。在“示例:使用CNN对姓氏进行分类”中，我们将深入研究一个更广泛的示例。
+
+HISTORICAL CONTEXT
+
+CNNs的名称和基本功能源于经典的数学运算卷积。卷积已经应用于各种工程学科，包括数字信号处理和计算机图形学。一般来说，卷积使用程序员指定的参数。这些参数被指定来匹配一些功能设计，如突出边缘或抑制高频声音。事实上，许多Photoshop滤镜都是应用于图像的固定卷积运算。然而，在深度学习和本实验中，我们从数据中学习卷积滤波器的参数，因此它对于解决当前的任务是最优的。
+
+CNN Hyperparameters
+
+为了理解不同的设计决策对CNN意味着什么，我们在图4-6中展示了一个示例。在本例中，单个“核”应用于输入矩阵。卷积运算(线性算子)的精确数学表达式对于理解这一节并不重要，但是从这个图中可以直观地看出，核是一个小的方阵，它被系统地应用于输入矩阵的不同位置。
+![image](https://github.com/saxtonman/NLP-/assets/173620482/07130c0d-7462-4088-ab73-c29de92b789c)
+图4-6 二维卷积运算。
+输入矩阵与单个产生输出矩阵的卷积核（也称为特征映射）在输入矩阵的每个位置应用内核。在每个应用程序中，内核乘以输入矩阵的值及其自身的值，然后将这些乘法相加kernel具有以下超参数配置：kernel_size=2，stride=1，padding=0，以及dilation=1。这些超参数解释如下:
+
+虽然经典卷积是通过指定核的具体值来设计的，但是CNN是通过指定控制CNN行为的超参数来设计的，然后使用梯度下降来为给定数据集找到最佳参数。两个主要的超参数控制卷积的形状(称为kernel_size)和卷积将在输入数据张量(称为stride)中相乘的位置。还有一些额外的超参数控制输入数据张量被0填充了多少(称为padding)，以及当应用到输入数据张量(称为dilation)时，乘法应该相隔多远。在下面的小节中，我们将更详细地介绍这些超参数。
+
+DIMENSION OF THE CONVOLUTION OPERATION
+
+首先要理解的概念是卷积运算的维数。在图4-6和本节的其他图中，我们使用二维卷积进行说明，但是根据数据的性质，还有更适合的其他维度的卷积。在PyTorch中，卷积可以是一维、二维或三维的，分别由Conv1d、Conv2d和Conv3d模块实现。一维卷积对于每个时间步都有一个特征向量的时间序列非常有用。在这种情况下，我们可以在序列维度上学习模式。NLP中的卷积运算大多是一维的卷积。另一方面，二维卷积试图捕捉数据中沿两个方向的时空模式;例如，在图像中沿高度和宽度维度——为什么二维卷积在图像处理中很流行。类似地，在三维卷积中，模式是沿着数据中的三维捕获的。例如，在视频数据中，信息是三维的，二维表示图像的帧，时间维表示帧的序列。就本课程而言，我们主要使用Conv1d。
+
+CHANNELS
+
+非正式地，通道(channel)是指沿输入中的每个点的特征维度。例如，在图像中，对应于RGB组件的图像中的每个像素有三个通道。在使用卷积时，文本数据也可以采用类似的概念。从概念上讲，如果文本文档中的“像素”是单词，那么通道的数量就是词汇表的大小。如果我们更细粒度地考虑字符的卷积，通道的数量就是字符集的大小(在本例中刚好是词汇表)。在PyTorch卷积实现中，输入通道的数量是in_channels参数。卷积操作可以在输出(out_channels)中产生多个通道。您可以将其视为卷积运算符将输入特征维“映射”到输出特征维。图4-7和图4-8说明了这个概念。
+![image](https://github.com/saxtonman/NLP-/assets/173620482/7e3171c1-e018-4594-8023-7e838ebee401)
+图4-7 卷积运算用两个输入矩阵（两个输入通道）表示相应的核也有两层，它将每层分别相乘，然后对结果求和。参数配置：input_channels=2, output_channels=1, kernel_size=2, tride=1, padding=0, and dilation=1.
+![image](https://github.com/saxtonman/NLP-/assets/173620482/ba75dd30-28f1-4d83-b19e-23a3bfc82448)
+图4-8 一种具有一个输入矩阵（一个输入通道）和两个卷积的卷积运算核（两个输出通道）。这些核分别应用于输入矩阵，并堆叠在输出张量。参数配置：input_channels=1, output_channels=2, kernel_size=2, tride=1, padding=0, and dilation=1.
+很难立即知道有多少输出通道适合当前的问题。为了简化这个困难，我们假设边界是1,1,024——我们可以有一个只有一个通道的卷积层，也可以有一个只有1,024个通道的卷积层。现在我们有了边界，接下来要考虑的是有多少个输入通道。一种常见的设计模式是，从一个卷积层到下一个卷积层，通道数量的缩减不超过2倍。这不是一个硬性的规则，但是它应该让您了解适当数量的out_channels是什么样子的。
+
+KERNEL SIZE
+
+核矩阵的宽度称为核大小(PyTorch中的kernel_size)。在图4-6中，核大小为2，而在图4-9中，我们显示了一个大小为3的内核。卷积将输入中的空间(或时间)本地信息组合在一起，每个卷积的本地信息量由内核大小控制。然而，通过增加核的大小，也会减少输出的大小(Dumoulin和Visin, 2016)。这就是为什么当核大小为3时，输出矩阵是图4-9中的2x2，而当核大小为2时，输出矩阵是图4-6中的3x3。
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/4bcb5469-6358-4fb0-abfa-12b231ac27bd)
 
 
+图4-9 将kernel_size=3的卷积应用于输入矩阵。结果是一个折衷的结果：在每次将内核应用于矩阵时，都会使用更多的局部信息，但输出的大小会更小.
+此外，可以将NLP应用程序中核大小的行为看作类似于通过查看单词组捕获语言模式的n-gram的行为。使用较小的核大小，可以捕获较小的频繁模式，而较大的核大小会导致较大的模式，这可能更有意义，但是发生的频率更低。较小的核大小会导致输出中的细粒度特性，而较大的核大小会导致粗粒度特性。
 
+STRIDE
+
+Stride控制卷积之间的步长。如果步长与核相同，则内核计算不会重叠。另一方面，如果跨度为1，则内核重叠最大。输出张量可以通过增加步幅的方式被有意的压缩来总结信息，如图4-10所示。
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/e37178fa-04d8-49a6-b144-686febbac33a)
+图4-10 应用于具有超参数步长的输入的kernel_size=2的卷积核等于2。这会导致内核采取更大的步骤，从而产生更小的输出矩阵。对于更稀疏地对输入矩阵进行二次采样非常有用。
+PADDING
+
+即使stride和kernel_size允许控制每个计算出的特征值有多大范围，它们也有一个有害的、有时是无意的副作用，那就是缩小特征映射的总大小(卷积的输出)。为了抵消这一点，输入数据张量被人为地增加了长度(如果是一维、二维或三维)、高度(如果是二维或三维)和深度(如果是三维)，方法是在每个维度上附加和前置0。这意味着CNN将执行更多的卷积，但是输出形状可以控制，而不会影响所需的核大小、步幅或扩展。图4-11展示了正在运行的填充。
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/bddfb299-a0f3-4aba-a75f-b420d544a976)
+图4-11 应用于高度和宽度等于的输入矩阵的kernel_size=2的卷积2。但是，由于填充（用深灰色正方形表示），输入矩阵的高度和宽度可以被放大。这通常与大小为3的内核一起使用，这样输出矩阵将等于输入矩阵的大小。
+DILATION
+
+膨胀控制卷积核如何应用于输入矩阵。在图4-12中，我们显示，将膨胀从1(默认值)增加到2意味着当应用于输入矩阵时，核的元素彼此之间是两个空格。另一种考虑这个问题的方法是在核中跨跃——在核中的元素或核的应用之间存在一个step size，即存在“holes”。这对于在不增加参数数量的情况下总结输入空间的更大区域是有用的。当卷积层被叠加时，扩张卷积被证明是非常有用的。连续扩张的卷积指数级地增大了“接受域”的大小；即网络在做出预测之前所看到的输入空间的大小。
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/def736f8-0a03-4264-bd23-685b323a47f3)
+图4-12 应用于超参数dilation=2的输入矩阵的kernel_size=2的卷积。从默认值开始膨胀的增加意味着核矩阵的元素在与输入矩阵相乘时进一步分散开来。进一步增大扩张会加剧这种扩散。
+3.3 Implementing CNNs in PyTorch
+
+在本节中，我们将通过端到端示例来利用上一节中介绍的概念。一般来说，神经网络设计的目标是找到一个能够完成任务的超参数组态。我们再次考虑在“示例:带有多层感知器的姓氏分类”中引入的现在很熟悉的姓氏分类任务，但是我们将使用CNNs而不是MLP。我们仍然需要应用最后一个线性层，它将学会从一系列卷积层创建的特征向量创建预测向量。这意味着目标是确定卷积层的配置，从而得到所需的特征向量。所有CNN应用程序都是这样的:首先有一组卷积层，它们提取一个feature map，然后将其作为上游处理的输入。在分类中，上游处理几乎总是应用线性(或fc)层。
+
+本课程中的实现遍历设计决策，以构建一个特征向量。我们首先构造一个人工数据张量，以反映实际数据的形状。数据张量的大小是三维的——这是向量化文本数据的最小批大小。如果你对一个字符序列中的每个字符使用onehot向量，那么onehot向量序列就是一个矩阵，而onehot矩阵的小批量就是一个三维张量。使用卷积的术语，每个onehot(通常是词汇表的大小)的大小是”input channels”的数量，字符序列的长度是“width”。
+
+在例4-14中，构造特征向量的第一步是将PyTorch的Conv1d类的一个实例应用到三维数据张量。通过检查输出的大小，你可以知道张量减少了多少。建议参考图4-9来直观地解释为什么输出张量在收缩。
+
+Example 4-14. Artificial data and using a Conv1d class
+
+batch_size = 2
+one_hot_size = 10
+sequence_width = 7
+data = torch.randn(batch_size, one_hot_size, sequence_width)
+#随机生成两个channel,词汇表大小为10，序列长度为7
+conv1 = Conv1d(in_channels=one_hot_size, out_channels=16,
+               kernel_size=3)
+intermediate1 = conv1(data)
+print(data.size())
+print(intermediate1.size())
+
+进一步减小输出张量的主要方法有三种。第一种方法是创建额外的卷积并按顺序应用它们。最终，对应的sequence_width (dim=2)维度的大小将为1。我们在例4-15中展示了应用两个额外卷积的结果。一般来说，对输出张量的约简应用卷积的过程是迭代的，需要一些猜测工作。我们的示例是这样构造的:经过三次卷积之后，最终的输出在最终维度上的大小为1。
+
+Example 4-15. The iterative application of convolutions to data
+
+conv2 = nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3)
+conv3 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3)
+
+intermediate2 = conv2(intermediate1)
+intermediate3 = conv3(intermediate2)
+
+print(intermediate2.size())
+print(intermediate3.size())
+y_output = intermediate3.squeeze()
+print(y_output.size())
+在每次卷积中，通道维数的大小都会增加，因为通道维数是每个数据点的特征向量。张量实际上是一个特征向量的最后一步是去掉讨厌的尺寸=1维。您可以使用squeeze()方法来实现这一点。该方法将删除size=1的所有维度并返回结果。然后，得到的特征向量可以与其他神经网络组件(如线性层)一起使用来计算预测向量。
+
+另外还有两种方法可以将张量简化为每个数据点的一个特征向量:将剩余的值压平为特征向量，并在额外维度上求平均值。这两种方法如示例4-16所示。使用第一种方法，只需使用PyTorch的view()方法将所有向量平展成单个向量。第二种方法使用一些数学运算来总结向量中的信息。最常见的操作是算术平均值，但沿feature map维数求和和使用最大值也是常见的。每种方法都有其优点和缺点。扁平化保留了所有的信息，但会导致比预期(或计算上可行)更大的特征向量。平均变得与额外维度的大小无关，但可能会丢失信息。
+
+Example 4-16. Two additional methods for reducing to feature vectors
+
+# Method 2 of reducing to feature vectors
+print(intermediate1.view(batch_size, -1).size())
+
+# Method 3 of reducing to feature vectors
+print(torch.mean(intermediate1, dim=2).size())
+# print(torch.max(intermediate1, dim=2).size())
+# print(torch.sum(intermediate1, dim=2).size())
+
+这种设计一系列卷积的方法是基于经验的:从数据的预期大小开始，处理一系列卷积，最终得到适合您的特征向量。虽然这种方法在实践中效果很好，但在给定卷积的超参数和输入张量的情况下，还有另一种计算张量输出大小的方法，即使用从卷积运算本身推导出的数学公式。
+
+3.4 Example: Classifying Surnames by Using a CNN
+
+为了证明CNN的有效性，让我们应用一个简单的CNN模型来分类姓氏。这项任务的许多细节与前面的MLP示例相同，但真正发生变化的是模型的构造和向量化过程。模型的输入，而不是我们在上一个例子中看到的收缩的onehot，将是一个onehot的矩阵。这种设计将使CNN能够更好地“view”字符的排列，并对在“示例:带有多层感知器的姓氏分类”中使用的收缩的onehot编码中丢失的序列信息进行编码。
+
+3.4.1 The SurnameDataset
+
+虽然姓氏数据集之前在“示例:带有多层感知器的姓氏分类”中进行了描述，但建议参考“姓氏数据集”来了解它的描述。尽管我们使用了来自“示例:带有多层感知器的姓氏分类”中的相同数据集，但在实现上有一个不同之处:数据集由onehot向量矩阵组成，而不是一个收缩的onehot向量。为此，我们实现了一个数据集类，它跟踪最长的姓氏，并将其作为矩阵中包含的行数提供给矢量化器。列的数量是onehot向量的大小(词汇表的大小)。示例4-17显示了对SurnameDataset.__getitem__的更改;我们显示对SurnameVectorizer的更改。在下一小节向量化。
+
+我们使用数据集中最长的姓氏来控制onehot矩阵的大小有两个原因。首先，将每一小批姓氏矩阵组合成一个三维张量，要求它们的大小相同。其次，使用数据集中最长的姓氏意味着可以以相同的方式处理每个小批处理。
+
+Example 4-17. SurnameDataset modified for passing the maximum surname length
+
+class SurnameDataset(Dataset):
+    # ... existing implementation from Section 4.2
+
+    def __getitem__(self, index):
+        row = self._target_df.iloc[index]
+
+        surname_matrix = \
+            self._vectorizer.vectorize(row.surname, self._max_seq_length)
+
+        nationality_index = \
+             self._vectorizer.nationality_vocab.lookup_token(row.nationality)
+
+        return {'x_surname': surname_matrix,
+                'y_nationality': nationality_index}
+
+3.4.2 Vocabulary, Vectorizer, and DataLoader
+
+在本例中，尽管词汇表和DataLoader的实现方式与“示例:带有多层感知器的姓氏分类”中的示例相同，但Vectorizer的vectorize()方法已经更改，以适应CNN模型的需要。具体来说，正如我们在示例4-18中的代码中所示，该函数将字符串中的每个字符映射到一个整数，然后使用该整数构造一个由onehot向量组成的矩阵。重要的是，矩阵中的每一列都是不同的onehot向量。主要原因是，我们将使用的Conv1d层要求数据张量在第0维上具有批处理，在第1维上具有通道，在第2维上具有特性。
+
+除了更改为使用onehot矩阵之外，我们还修改了矢量化器，以便计算姓氏的最大长度并将其保存为max_surname_length
+
+Example 4-18. Implementing the Surname Vectorizer for CNNs
+
+class SurnameVectorizer(object):
+    """ The Vectorizer which coordinates the Vocabularies and puts them to use"""
+    def vectorize(self, surname):
+        """
+        Args:
+            surname (str): the surname
+        Returns:
+            one_hot_matrix (np.ndarray): a matrix of one-hot vectors
+        """
+
+        one_hot_matrix_size = (len(self.character_vocab), self.max_surname_length)
+        one_hot_matrix = np.zeros(one_hot_matrix_size, dtype=np.float32)
+
+        for position_index, character in enumerate(surname):
+            character_index = self.character_vocab.lookup_token(character)
+            one_hot_matrix[character_index][position_index] = 1
+
+        return one_hot_matrix
+
+    @classmethod
+    def from_dataframe(cls, surname_df):
+        """Instantiate the vectorizer from the dataset dataframe
+
+        Args:
+            surname_df (pandas.DataFrame): the surnames dataset
+        Returns:
+            an instance of the SurnameVectorizer
+        """
+        character_vocab = Vocabulary(unk_token="@")
+        nationality_vocab = Vocabulary(add_unk=False)
+        max_surname_length = 0
+
+        for index, row in surname_df.iterrows():
+            max_surname_length = max(max_surname_length, len(row.surname))
+            #找到最长的姓
+            for letter in row.surname:
+                character_vocab.add_token(letter)
+            nationality_vocab.add_token(row.nationality)
+
+        return cls(character_vocab, nationality_vocab, max_surname_length)
+
+3.4.3 Reimplementing the SurnameClassifier with Convolutional Networks
+
+我们在本例中使用的模型是使用我们在“卷积神经网络”中介绍的方法构建的。实际上，我们在该部分中创建的用于测试卷积层的“人工”数据与姓氏数据集中使用本例中的矢量化器的数据张量的大小完全匹配。正如在示例4-19中所看到的，它与我们在“卷积神经网络”中引入的Conv1d序列既有相似之处，也有需要解释的新添加内容。具体来说，该模型类似于“卷积神经网络”，它使用一系列一维卷积来增量地计算更多的特征，从而得到一个单特征向量。
+
+然而，本例中的新内容是使用sequence和ELU PyTorch模块。序列模块是封装线性操作序列的方便包装器。在这种情况下，我们使用它来封装Conv1d序列的应用程序。ELU是类似于实验3中介绍的ReLU的非线性函数，但是它不是将值裁剪到0以下，而是对它们求幂。ELU已经被证明是卷积层之间使用的一种很有前途的非线性(Clevert et al.， 2015)。
+
+在本例中，我们将每个卷积的通道数与num_channels超参数绑定。我们可以选择不同数量的通道分别进行卷积运算。这样做需要优化更多的超参数。我们发现256足够大，可以使模型达到合理的性能。
+
+Example 4-19. The CNN-based SurnameClassifier
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SurnameClassifier(nn.Module):
+    def __init__(self, initial_num_channels, num_classes, num_channels):
+        """
+        Args:
+            initial_num_channels (int): size of the incoming feature vector
+            num_classes (int): size of the output prediction vector
+            num_channels (int): constant channel size to use throughout network
+        """
+        super(SurnameClassifier, self).__init__()
+
+        self.convnet = nn.Sequential(
+            nn.Conv1d(in_channels=initial_num_channels,
+                      out_channels=num_channels, kernel_size=3),
+            nn.ELU(),
+            nn.Conv1d(in_channels=num_channels, out_channels=num_channels,
+                      kernel_size=3, stride=2),
+            nn.ELU(),
+            nn.Conv1d(in_channels=num_channels, out_channels=num_channels,
+                      kernel_size=3, stride=2),
+            nn.ELU(),
+            nn.Conv1d(in_channels=num_channels, out_channels=num_channels,
+                      kernel_size=3),
+            nn.ELU()
+        )
+        self.fc = nn.Linear(num_channels, num_classes)
+        #采用线性分类器
+
+    def forward(self, x_surname, apply_softmax=False):
+        """The forward pass of the classifier
+
+        Args:
+            x_surname (torch.Tensor): an input data tensor.
+                x_surname.shape should be (batch, initial_num_channels,
+                                           max_surname_length)
+            apply_softmax (bool): a flag for the softmax activation
+                should be false if used with the Cross Entropy losses
+        Returns:
+            the resulting tensor. tensor.shape should be (batch, num_classes)
+        """
+        features = self.convnet(x_surname).squeeze(dim=2)
+        prediction_vector = self.fc(features)
+
+        if apply_softmax:
+            prediction_vector = F.softmax(prediction_vector, dim=1)
+
+        return prediction_vector
+
+3.4.4 The Training Routine
+
+训练程序包括以下似曾相识的的操作序列:实例化数据集,实例化模型,实例化损失函数,实例化优化器,遍历数据集的训练分区和更新模型参数,遍历数据集的验证分区和测量性能,然后重复数据集迭代一定次数。此时，这是本书到目前为止的第三个训练例程实现，应该将这个操作序列内部化。对于这个例子，我们将不再详细描述具体的训练例程，因为它与“示例:带有多层感知器的姓氏分类”中的例程完全相同。但是，输入参数是不同的，可以在示例4-20中看到。
+
+Example 4-20. Input arguments to the CNN surname classifier
+
+args = Namespace(
+    # Data and Path information
+    surname_csv="data/surnames/surnames_with_splits.csv",
+    vectorizer_file="vectorizer.json",
+    model_state_file="model.pth",
+    save_dir="model_storage/ch4/cnn",
+    # Model hyper parameters
+    hidden_dim=100,
+    num_channels=256,
+    # Training hyper parameters
+    seed=1337,
+    learning_rate=0.001,
+    batch_size=128,
+    num_epochs=100,
+    early_stopping_criteria=5,
+    dropout_p=0.1,
+    # Runtime omitted for space ...
+)
+3.4.5 Model Evaluation and Prediction
+
+要理解模型的性能，需要对性能进行定量和定性的度量。下面将描述这两个度量的基本组件。建议你扩展它们，以探索该模型及其所学习到的内容。
+
+Evaluating on the Test Dataset 正如“示例:带有多层感知器的姓氏分类”中的示例与本示例之间的训练例程没有变化一样，执行评估的代码也没有变化。总之，调用分类器的eval()方法来防止反向传播，并迭代测试数据集。与 MLP 约 50% 的性能相比，该模型的测试集性能准确率约为56%。尽管这些性能数字绝不是这些特定架构的上限，但是通过一个相对简单的CNN模型获得的改进应该足以让您在文本数据上尝试CNNs。
+
+Classifying or retrieving top predictions for a new surname
+
+在本例中，predict_nationality()函数的一部分发生了更改，如示例4-21所示:我们没有使用视图方法重塑新创建的数据张量以添加批处理维度，而是使用PyTorch的unsqueeze()函数在批处理应该在的位置添加大小为1的维度。相同的更改反映在predict_topk_nationality()函数中。
+
+Example 4-21. Using the trained model to make predictions
+
+def predict_nationality(surname, classifier, vectorizer):
+    """Predict the nationality from a new surname
+
+    Args:
+        surname (str): the surname to classifier
+        classifier (SurnameClassifer): an instance of the classifier
+        vectorizer (SurnameVectorizer): the corresponding vectorizer
+    Returns:
+        a dictionary with the most likely nationality and its probability
+    """
+    vectorized_surname = vectorizer.vectorize(surname)
+    vectorized_surname = torch.tensor(vectorized_surname).unsqueeze(0)
+    #与view方法相比，unsequeeze方法更加简便
+    result = classifier(vectorized_surname, apply_softmax=True)
+
+    probability_values, indices = result.max(dim=1)
+    index = indices.item()
+
+    predicted_nationality = vectorizer.nationality_vocab.lookup_index(index)
+    probability_value = probability_values.item()
+
+    return {'nationality': predicted_nationality, 'probability': probability_value}
+3.5 Miscellaneous Topics in CNNs
+
+为了结束我们的讨论，我们概述了几个其他的主题，这些主题是CNNs的核心，但在它们的共同使用中起着主要作用。特别是，你将看到Pooling操作、batch Normalization、network-in-network connection和residual connections的描述。
+
+3.5.1 Pooling Operation
+
+Pooling是将高维特征映射总结为低维特征映射的操作。卷积的输出是一个特征映射。feature map中的值总结了输入的一些区域。由于卷积计算的重叠性，许多计算出的特征可能是冗余的。Pooling是一种将高维(可能是冗余的)特征映射总结为低维特征映射的方法。在形式上，池是一种像sum、mean或max这样的算术运算符，系统地应用于feature map中的局部区域，得到的池操作分别称为sum pooling、average pooling和max pooling。池还可以作为一种方法，将较大但较弱的feature map的统计强度改进为较小但较强的feature map。图4-13说明了Pooling。
+
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/92e8b37e-5edb-4d1d-87ad-81ba964b1d0c)
+图4-13 这里所示的池操作在功能上与卷积相同：它应用于输入矩阵中的不同位置。然而，池操作不是将输入矩阵的值相乘和求和，而是应用一些函数G来汇集这些值。G可以是任何运算，但求和、求最大值和计算平均值是最常见的。
+3.5.2 Batch Normalization (BatchNorm)
+
+批处理标准化是设计网络时经常使用的一种工具。BatchNorm对CNN的输出进行转换，方法是将激活量缩放为零均值和单位方差。它用于Z-transform的平均值和方差值每批更新一次，这样任何单个批中的波动都不会太大地移动或影响它。BatchNorm允许模型对参数的初始化不那么敏感，并且简化了学习速率的调整(Ioffe and Szegedy, 2015)。在PyTorch中，批处理规范是在nn模块中定义的。例4-22展示了如何用卷积和线性层实例化和使用批处理规范。
+
+Example 4-22. Using s Conv1D layer with batch normalization.
+
+# ...
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=10,
+                               kernel_size=5,
+                               stride=1)
+        self.conv1_bn = nn.BatchNorm1d(num_features=10)
+        # ...
+
+    def forward(self, x):
+       # ...
+       x = F.relu(self.conv1(x))
+       x = self.conv1_bn(x)
+       # ...
+
+3.5.3 Network-in-Network Connections (1x1 Convolutions)
+
+Network-in-Network (NiN)连接是具有kernel_size=1的卷积内核，具有一些有趣的特性。具体来说，1x1卷积就像通道之间的一个完全连通的线性层。这在从多通道feature map映射到更浅的feature map时非常有用。在图4-14中，我们展示了一个应用于输入矩阵的NiN连接。它将两个通道简化为一个通道。因此，NiN或1x1卷积提供了一种廉价的方法来合并参数较少的额外非线性(Lin et al.， 2013)。
+
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/e9d01866-425e-44cc-b811-2e096bfdba57)
+图4-14 一个1×1卷积运算的例子。观察1×1卷积是如何进行的操作将通道数从两个减少到一个。
+3.5.4 Residual Connections/Residual Block
+
+CNNs中最重要的趋势之一是Residual connection，它支持真正深层的网络(超过100层)。它也称为skip connection。如果将卷积函数表示为conv，则residual block的输出如下:
+
+
+然而，这个操作有一个隐含的技巧，如图4-15所示。对于要添加到卷积输出的输入，它们必须具有相同的形状。为此，标准做法是在卷积之前应用填充。在图4-15中，填充尺寸为1，卷积大小为3。
+
+![image](https://github.com/saxtonman/NLP-/assets/173620482/261afe18-a636-48e9-8305-be13bb6371e6)
+图4-15 残差连接是一种将原始矩阵加到卷积输出上的方法。当将卷积层应用于输入矩阵并将结果添加到输入矩阵时，以上直观地描述了这一点。创建与输入大小相同的输出的通用超参数设置是让kernel_size=3和padding=1。一般来说，任何带 adding=(floor(kernel_size)/2-1) 的奇数内核大小都将导致与输入大小相同的输出。关于填充和卷曲的直观说明，请参见图4-11。卷积层产生的矩阵被加到输入端，最后的结果是剩余连接计算的输出端。
+四、实验任务
+1. 通过“示例:带有多层感知器的姓氏分类”，掌握多层感知器在多层分类中的应用
+
+2. 掌握每种类型的神经网络层对它所计算的数据张量的大小和形状的影响
+
+3. 尝试带有dropout的SurnameClassifier模型，看看它如何更改结果
+
+请完成实验任务，并撰写实验报告。
 
